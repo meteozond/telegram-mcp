@@ -1089,6 +1089,61 @@ async def set_chat_sound(
         return log_and_format_error("set_chat_sound", e, chat_id=chat_id)
 
 
+def _describe_sound(sound) -> Optional[str]:
+    if sound is None:
+        return None
+    name = type(sound).__name__
+    if name == "NotificationSoundDefault":
+        return "default"
+    if name == "NotificationSoundNone":
+        return "none"
+    if name == "NotificationSoundRingtone":
+        return str(sound.id)
+    return f"local:{getattr(sound, 'title', '')}"
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Notify Settings", openWorldHint=True, readOnlyHint=True)
+)
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def get_notify_settings(chat_id: Union[int, str], account: Optional[str] = None) -> str:
+    """
+    Show a chat's personal notification settings as stored on the server.
+
+    sound per platform is "default", "none", a ringtone id, or null (not set = default).
+    """
+    try:
+        cl = get_client(account)
+        from telethon.tl.types import InputNotifyPeer
+
+        input_peer = await resolve_input_entity(chat_id, cl)
+        current = await cl(
+            functions.account.GetNotifySettingsRequest(peer=InputNotifyPeer(input_peer))
+        )
+        mute_until = current.mute_until
+        if isinstance(mute_until, datetime):
+            mute_until = int(mute_until.timestamp())
+        return json.dumps(
+            {
+                "chat_id": chat_id,
+                "mute_until": mute_until,
+                "muted": bool(mute_until and mute_until > time.time()),
+                "silent": current.silent,
+                "show_previews": current.show_previews,
+                "sound": {
+                    "ios": _describe_sound(current.ios_sound),
+                    "android": _describe_sound(current.android_sound),
+                    "other": _describe_sound(current.other_sound),
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        return log_and_format_error("get_notify_settings", e, chat_id=chat_id)
+
+
 @mcp.tool(annotations=ToolAnnotations(title="List Ringtones", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
 async def list_ringtones(account: Optional[str] = None) -> str:
