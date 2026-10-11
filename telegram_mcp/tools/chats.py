@@ -1055,6 +1055,83 @@ async def unmute_chat(chat_id: Union[int, str], account: Optional[str] = None) -
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Remove Notify Exception",
+        openWorldHint=True,
+        destructiveHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def remove_notify_exception(chat_id: Union[int, str], account: Optional[str] = None) -> str:
+    """
+    Remove a chat from notification exceptions so it follows the global default again.
+
+    mute_chat/unmute_chat both create an exception (Muted/Unmuted); this is the
+    "Remove" button in Settings > Notifications > Exceptions.
+    """
+    try:
+        cl = get_client(account)
+        from telethon.tl.types import InputPeerNotifySettings
+
+        peer = await resolve_entity(chat_id, cl)
+        # Empty settings (no flags) reset the peer to the default, as tdesktop's resetToDefault does.
+        await cl(
+            functions.account.UpdateNotifySettingsRequest(
+                peer=peer, settings=InputPeerNotifySettings()
+            )
+        )
+        return f"Chat {chat_id} removed from notification exceptions."
+    except Exception as e:
+        return log_and_format_error("remove_notify_exception", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="List Notify Exceptions", openWorldHint=True, readOnlyHint=True
+    )
+)
+@with_account(readonly=True)
+async def list_notify_exceptions(account: Optional[str] = None) -> str:
+    """
+    List chats with personal notification settings (exceptions) and their status.
+
+    status is "muted" (mute_until in the future) or "unmuted" (mute_until in the past/0).
+    """
+    try:
+        cl = get_client(account)
+        result = await cl(functions.account.GetNotifyExceptionsRequest())
+        names = {}
+        for entity in [*getattr(result, "users", []), *getattr(result, "chats", [])]:
+            names[entity.id] = (entity, get_entity_type(entity))
+        now = int(time.time())
+        records = []
+        for update in getattr(result, "updates", []):
+            notify_peer = getattr(update, "peer", None)
+            settings = getattr(update, "notify_settings", None)
+            if notify_peer is None or settings is None or not hasattr(notify_peer, "peer"):
+                continue
+            peer_id = utils.get_peer_id(notify_peer.peer)
+            entity, entity_type = names.get(utils.resolve_id(peer_id)[0], (None, None))
+            mute_until = settings.mute_until
+            if isinstance(mute_until, datetime):
+                mute_until = int(mute_until.timestamp())
+            records.append(
+                {
+                    "chat_id": peer_id,
+                    "name": utils.get_display_name(entity) if entity else None,
+                    "type": entity_type,
+                    "status": "muted" if mute_until and mute_until > now else "unmuted",
+                    "mute_until": mute_until,
+                }
+            )
+        return json.dumps(records, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return log_and_format_error("list_notify_exceptions", e)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Archive Chat", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
