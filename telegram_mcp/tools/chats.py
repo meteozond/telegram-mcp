@@ -971,6 +971,15 @@ MUTE_FOREVER = 2**31 - 1
 
 
 async def _update_notify_settings(cl, peer, **changes) -> None:
+    """Merge changes into a chat's notification settings (see _merge_notify_settings)."""
+    from telethon.tl.types import InputNotifyPeer
+
+    await _merge_notify_settings(
+        cl, InputNotifyPeer(await resolve_input_entity(peer, cl)), **changes
+    )
+
+
+async def _merge_notify_settings(cl, notify_peer, **changes) -> None:
     """
     Merge changes into the chat's current notification settings and save them.
 
@@ -978,10 +987,9 @@ async def _update_notify_settings(cl, peer, **changes) -> None:
     drop the others (e.g. muting would reset a custom tone). tdesktop merges the
     same way before every account.updateNotifySettings call.
     """
-    from telethon.tl.types import InputNotifyPeer, InputPeerNotifySettings
+    from telethon.tl.types import InputPeerNotifySettings
 
-    input_peer = await resolve_input_entity(peer, cl)
-    current = await cl(functions.account.GetNotifySettingsRequest(peer=InputNotifyPeer(input_peer)))
+    current = await cl(functions.account.GetNotifySettingsRequest(peer=notify_peer))
     fields = {
         "show_previews": current.show_previews,
         "silent": current.silent,
@@ -996,7 +1004,7 @@ async def _update_notify_settings(cl, peer, **changes) -> None:
     fields.update(changes)
     await cl(
         functions.account.UpdateNotifySettingsRequest(
-            peer=InputNotifyPeer(input_peer), settings=InputPeerNotifySettings(**fields)
+            peer=notify_peer, settings=InputPeerNotifySettings(**fields)
         )
     )
 
@@ -1051,6 +1059,25 @@ async def unmute_chat(chat_id: Union[int, str], account: Optional[str] = None) -
         return log_and_format_error("unmute_chat", e, chat_id=chat_id)
 
 
+SOUND_HINT = 'sound must be "default", "none" or a ringtone id from list_ringtones.'
+
+
+def _parse_sound(sound: str):
+    from telethon.tl.types import (
+        NotificationSoundDefault,
+        NotificationSoundNone,
+        NotificationSoundRingtone,
+    )
+
+    if sound == "default":
+        return NotificationSoundDefault()
+    if sound == "none":
+        return NotificationSoundNone()
+    if sound.isdigit():
+        return NotificationSoundRingtone(id=int(sound))
+    return None
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Set Chat Sound", openWorldHint=True, destructiveHint=True, idempotentHint=True
@@ -1069,20 +1096,9 @@ async def set_chat_sound(
     """
     try:
         cl = get_client(account)
-        from telethon.tl.types import (
-            NotificationSoundDefault,
-            NotificationSoundNone,
-            NotificationSoundRingtone,
-        )
-
-        if sound == "default":
-            value = NotificationSoundDefault()
-        elif sound == "none":
-            value = NotificationSoundNone()
-        elif sound.isdigit():
-            value = NotificationSoundRingtone(id=int(sound))
-        else:
-            return 'sound must be "default", "none" or a ringtone id from list_ringtones.'
+        value = _parse_sound(sound)
+        if value is None:
+            return SOUND_HINT
         await _update_notify_settings(cl, chat_id, sound=value)
         return f"Chat {chat_id} sound set to {sound}."
     except Exception as e:
@@ -1142,6 +1158,94 @@ async def get_notify_settings(chat_id: Union[int, str], account: Optional[str] =
         )
     except Exception as e:
         return log_and_format_error("get_notify_settings", e, chat_id=chat_id)
+
+
+DEFAULT_NOTIFY_SCOPES = ("users", "chats", "broadcasts")
+
+
+def _default_notify_peer(scope: str):
+    from telethon.tl.types import InputNotifyBroadcasts, InputNotifyChats, InputNotifyUsers
+
+    return {
+        "users": InputNotifyUsers,
+        "chats": InputNotifyChats,
+        "broadcasts": InputNotifyBroadcasts,
+    }[scope]()
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get Default Notify Settings", openWorldHint=True, readOnlyHint=True
+    )
+)
+@with_account(readonly=True)
+async def get_default_notify(account: Optional[str] = None) -> str:
+    """
+    Show the global notification defaults: users = Private chats, chats = Groups,
+    broadcasts = Channels. Chats without a personal exception follow these.
+    """
+    try:
+        cl = get_client(account)
+        records = {}
+        for scope in DEFAULT_NOTIFY_SCOPES:
+            current = await cl(
+                functions.account.GetNotifySettingsRequest(peer=_default_notify_peer(scope))
+            )
+            mute_until = current.mute_until
+            if isinstance(mute_until, datetime):
+                mute_until = int(mute_until.timestamp())
+            records[scope] = {
+                "enabled": not (mute_until and mute_until > time.time()),
+                "mute_until": mute_until,
+                "sound": {
+                    "ios": _describe_sound(current.ios_sound),
+                    "android": _describe_sound(current.android_sound),
+                    "other": _describe_sound(current.other_sound),
+                },
+            }
+        return json.dumps(records, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return log_and_format_error("get_default_notify", e)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Set Default Notify Settings",
+        openWorldHint=True,
+        destructiveHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+async def set_default_notify(
+    scope: str,
+    enabled: Optional[bool] = None,
+    sound: Optional[str] = None,
+    account: Optional[str] = None,
+) -> str:
+    """
+    Change a global notification default (the Private chats / Groups / Channels toggles).
+
+    scope: "users" (Private chats), "chats" (Groups) or "broadcasts" (Channels).
+    enabled: turn notifications on/off. sound: "default", "none" or a ringtone id.
+    """
+    try:
+        if scope not in DEFAULT_NOTIFY_SCOPES:
+            return f"scope must be one of {', '.join(DEFAULT_NOTIFY_SCOPES)}."
+        changes = {}
+        if enabled is not None:
+            changes["mute_until"] = 0 if enabled else MUTE_FOREVER
+        if sound is not None:
+            changes["sound"] = _parse_sound(sound)
+            if changes["sound"] is None:
+                return SOUND_HINT
+        if not changes:
+            return "Nothing to change: pass enabled and/or sound."
+        cl = get_client(account)
+        await _merge_notify_settings(cl, _default_notify_peer(scope), **changes)
+        return f"Default notify settings for {scope} updated (enabled={enabled}, sound={sound})."
+    except Exception as e:
+        return log_and_format_error("set_default_notify", e, scope=scope)
 
 
 @mcp.tool(annotations=ToolAnnotations(title="List Ringtones", openWorldHint=True, readOnlyHint=True))
