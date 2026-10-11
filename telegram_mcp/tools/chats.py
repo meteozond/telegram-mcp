@@ -967,6 +967,40 @@ async def get_full_chat(chat_id: Union[int, str], account: Optional[str] = None)
         return log_and_format_error("get_full_chat", e, chat_id=chat_id)
 
 
+MUTE_FOREVER = 2**31 - 1
+
+
+async def _update_notify_settings(cl, peer, **changes) -> None:
+    """
+    Merge changes into the chat's current notification settings and save them.
+
+    The API replaces the whole settings object, so sending a single field would
+    drop the others (e.g. muting would reset a custom tone). tdesktop merges the
+    same way before every account.updateNotifySettings call.
+    """
+    from telethon.tl.types import InputNotifyPeer, InputPeerNotifySettings
+
+    input_peer = await resolve_input_entity(peer, cl)
+    current = await cl(functions.account.GetNotifySettingsRequest(peer=InputNotifyPeer(input_peer)))
+    fields = {
+        "show_previews": current.show_previews,
+        "silent": current.silent,
+        "mute_until": current.mute_until,
+        "sound": current.other_sound or current.android_sound or current.ios_sound,
+        "stories_muted": current.stories_muted,
+        "stories_hide_sender": current.stories_hide_sender,
+        "stories_sound": current.stories_other_sound
+        or current.stories_android_sound
+        or current.stories_ios_sound,
+    }
+    fields.update(changes)
+    await cl(
+        functions.account.UpdateNotifySettingsRequest(
+            peer=InputNotifyPeer(input_peer), settings=InputPeerNotifySettings(**fields)
+        )
+    )
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Mute Chat", openWorldHint=True, destructiveHint=True, idempotentHint=True
@@ -974,38 +1008,26 @@ async def get_full_chat(chat_id: Union[int, str], account: Optional[str] = None)
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
-async def mute_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
+async def mute_chat(
+    chat_id: Union[int, str],
+    duration_seconds: Optional[int] = None,
+    account: Optional[str] = None,
+) -> str:
     """
-    Mute notifications for a chat.
+    Mute notifications for a chat, forever or for duration_seconds
+    (e.g. 7200 = "Mute for 2 hours"). Keeps the chat's tone and other settings.
     """
     try:
         cl = get_client(account)
-        from telethon.tl.types import InputPeerNotifySettings
-
-        peer = await resolve_entity(chat_id, cl)
-        await cl(
-            functions.account.UpdateNotifySettingsRequest(
-                peer=peer, settings=InputPeerNotifySettings(mute_until=2**31 - 1)
-            )
+        if duration_seconds is not None and duration_seconds <= 0:
+            return "duration_seconds must be positive; use unmute_chat to unmute."
+        mute_until = (
+            MUTE_FOREVER if duration_seconds is None else int(time.time()) + duration_seconds
         )
-        return f"Chat {chat_id} muted."
-    except (ImportError, AttributeError) as type_err:
-        try:
-            # Alternative approach directly using raw API
-            peer = await resolve_input_entity(chat_id, cl)
-            await cl(
-                functions.account.UpdateNotifySettingsRequest(
-                    peer=peer,
-                    settings={
-                        "mute_until": 2**31 - 1,  # Far future
-                        "show_previews": False,
-                        "silent": True,
-                    },
-                )
-            )
-            return f"Chat {chat_id} muted (using alternative method)."
-        except Exception as alt_e:
-            return log_and_format_error("mute_chat", alt_e, chat_id=chat_id)
+        await _update_notify_settings(cl, chat_id, mute_until=mute_until)
+        if duration_seconds is None:
+            return f"Chat {chat_id} muted."
+        return f"Chat {chat_id} muted for {duration_seconds} seconds."
     except Exception as e:
         return log_and_format_error("mute_chat", e, chat_id=chat_id)
 
@@ -1019,38 +1041,76 @@ async def mute_chat(chat_id: Union[int, str], account: Optional[str] = None) -> 
 @validate_id("chat_id")
 async def unmute_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
-    Unmute notifications for a chat.
+    Unmute notifications for a chat. Keeps the chat's tone and other settings.
     """
     try:
         cl = get_client(account)
-        from telethon.tl.types import InputPeerNotifySettings
-
-        peer = await resolve_entity(chat_id, cl)
-        await cl(
-            functions.account.UpdateNotifySettingsRequest(
-                peer=peer, settings=InputPeerNotifySettings(mute_until=0)
-            )
-        )
+        await _update_notify_settings(cl, chat_id, mute_until=0)
         return f"Chat {chat_id} unmuted."
-    except (ImportError, AttributeError) as type_err:
-        try:
-            # Alternative approach directly using raw API
-            peer = await resolve_input_entity(chat_id, cl)
-            await cl(
-                functions.account.UpdateNotifySettingsRequest(
-                    peer=peer,
-                    settings={
-                        "mute_until": 0,  # Unmute (current time)
-                        "show_previews": True,
-                        "silent": False,
-                    },
-                )
-            )
-            return f"Chat {chat_id} unmuted (using alternative method)."
-        except Exception as alt_e:
-            return log_and_format_error("unmute_chat", alt_e, chat_id=chat_id)
     except Exception as e:
         return log_and_format_error("unmute_chat", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Set Chat Sound", openWorldHint=True, destructiveHint=True, idempotentHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def set_chat_sound(
+    chat_id: Union[int, str], sound: str, account: Optional[str] = None
+) -> str:
+    """
+    Set the notification tone for a chat ("Select tone" / "Disable sound").
+
+    sound: "default", "none" (notifications arrive without sound),
+    or a ringtone id from list_ringtones.
+    """
+    try:
+        cl = get_client(account)
+        from telethon.tl.types import (
+            NotificationSoundDefault,
+            NotificationSoundNone,
+            NotificationSoundRingtone,
+        )
+
+        if sound == "default":
+            value = NotificationSoundDefault()
+        elif sound == "none":
+            value = NotificationSoundNone()
+        elif sound.isdigit():
+            value = NotificationSoundRingtone(id=int(sound))
+        else:
+            return 'sound must be "default", "none" or a ringtone id from list_ringtones.'
+        await _update_notify_settings(cl, chat_id, sound=value)
+        return f"Chat {chat_id} sound set to {sound}."
+    except Exception as e:
+        return log_and_format_error("set_chat_sound", e, chat_id=chat_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="List Ringtones", openWorldHint=True, readOnlyHint=True))
+@with_account(readonly=True)
+async def list_ringtones(account: Optional[str] = None) -> str:
+    """
+    List notification tones saved to the account, for use with set_chat_sound.
+    """
+    try:
+        cl = get_client(account)
+        result = await cl(functions.account.GetSavedRingtonesRequest(hash=0))
+        records = []
+        for document in getattr(result, "ringtones", []):
+            title = None
+            for attribute in document.attributes:
+                title = getattr(attribute, "title", None) or getattr(
+                    attribute, "file_name", None
+                )
+                if title:
+                    break
+            records.append({"id": str(document.id), "title": title})
+        return json.dumps(records, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return log_and_format_error("list_ringtones", e)
 
 
 @mcp.tool(
