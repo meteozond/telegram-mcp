@@ -982,6 +982,50 @@ def _is_muted(mute_until: Optional[int]) -> bool:
     return bool(mute_until and mute_until > time.time())
 
 
+# Sound platforms: "other" = desktop/web clients (this connection), "ios" = iPhone app.
+_SOUND_PLATFORMS = ("other", "ios")
+_DEFAULT_SOUND_PLATFORMS = ["other", "ios"]
+_PLATFORM_DEVICES = {
+    "ios": {"device_model": "iPhone", "system_version": "iOS 18.7", "app_version": "12.0"},
+}
+_platform_clients: Dict[Any, Any] = {}
+
+
+async def _platform_client(cl, platform: str):
+    """
+    Return a connection the server treats as `platform` for notification sounds.
+
+    The server files InputPeerNotifySettings.sound under the platform of the
+    connection that sends it (lang_pack "ios" lands in ios_sound, checked
+    2026-10-13). "other" is the regular connection; for "ios" a second connection
+    is opened on the same authorization. Telethon has no public lang_pack option,
+    hence the private _init_request.
+    """
+    if platform == "other":
+        return cl
+    key = (id(cl), platform)
+    if key not in _platform_clients:
+        second = TelegramClient(
+            StringSession(StringSession.save(cl.session)),
+            cl.api_id,
+            cl.api_hash,
+            receive_updates=False,
+            proxy=getattr(cl, "_proxy", None),
+            **_PLATFORM_DEVICES[platform],
+        )
+        second._init_request.lang_pack = platform
+        await second.connect()
+        _platform_clients[key] = second
+    return _platform_clients[key]
+
+
+def _check_platforms(platforms: Optional[List[str]]) -> Optional[str]:
+    unknown = set(platforms or []) - set(_SOUND_PLATFORMS)
+    if not platforms or unknown:
+        return f"platforms must be a non-empty subset of {', '.join(_SOUND_PLATFORMS)}."
+    return None
+
+
 async def _update_notify_settings(cl, peer, **changes) -> None:
     """Merge changes into a chat's notification settings (see _merge_notify_settings)."""
     await _merge_notify_settings(
@@ -989,7 +1033,19 @@ async def _update_notify_settings(cl, peer, **changes) -> None:
     )
 
 
-async def _merge_notify_settings(cl, notify_peer, **changes) -> None:
+async def _set_sound(cl, notify_peer, sound, platforms: List[str], **changes) -> None:
+    """Write `sound` for each platform; other `changes` go with the first write only."""
+    for index, platform in enumerate(platforms):
+        await _merge_notify_settings(
+            await _platform_client(cl, platform),
+            notify_peer,
+            platform=platform,
+            sound=sound,
+            **(changes if index == 0 else {}),
+        )
+
+
+async def _merge_notify_settings(cl, notify_peer, platform: str = "other", **changes) -> None:
     """
     Merge changes into the current notification settings and save them.
 
@@ -998,18 +1054,19 @@ async def _merge_notify_settings(cl, notify_peer, **changes) -> None:
     same way before every account.updateNotifySettings call. This costs two
     requests per change instead of one.
 
-    Only other_sound is echoed back: the server files the sound we send under
-    this client's platform, so copying ios/android tones would overwrite it.
+    Only the connection's own platform sound is echoed back: the server files the
+    sound we send under that platform, so copying another platform's tone would
+    overwrite it.
     """
     current = await cl(functions.account.GetNotifySettingsRequest(peer=notify_peer))
     fields = {
         "show_previews": current.show_previews,
         "silent": current.silent,
         "mute_until": current.mute_until,
-        "sound": current.other_sound,
+        "sound": getattr(current, f"{platform}_sound"),
         "stories_muted": current.stories_muted,
         "stories_hide_sender": current.stories_hide_sender,
-        "stories_sound": current.stories_other_sound,
+        "stories_sound": getattr(current, f"stories_{platform}_sound"),
     }
     fields.update(changes)
     await cl(
@@ -1099,24 +1156,34 @@ def _parse_sound(sound: str):
 @with_account(readonly=False)
 @validate_id("chat_id")
 async def set_chat_sound(
-    chat_id: Union[int, str], sound: str, account: Optional[str] = None
+    chat_id: Union[int, str],
+    sound: str,
+    platforms: Optional[List[str]] = None,
+    account: Optional[str] = None,
 ) -> str:
     """
     Set the notification tone for a chat ("Select tone" / "Disable sound").
 
     sound: "default", "none" (notifications arrive without sound),
-    or a ringtone id from list_ringtones. The tone applies to desktop/other
-    clients only; phones keep their own. A tone alone does not show up in
-    list_notify_exceptions, and remove_notify_exception clears it.
+    or a ringtone id from list_ringtones.
+    platforms: where the tone applies, "other" (desktop/web) and/or "ios";
+    default both. Android keeps its own tone.
+    A tone alone does not show up in list_notify_exceptions, and
+    remove_notify_exception clears it.
     Telegram rate-limits these changes: for many chats, call one at a time with a pause.
     """
     try:
-        cl = get_client(account)
+        platforms = _DEFAULT_SOUND_PLATFORMS if platforms is None else platforms
+        error = _check_platforms(platforms)
+        if error:
+            return error
         value = _parse_sound(sound)
         if value is None:
             return _SOUND_HINT
-        await _update_notify_settings(cl, chat_id, sound=value)
-        return f"Chat {chat_id} sound set to {sound}."
+        cl = get_client(account)
+        notify_peer = types.InputNotifyPeer(await resolve_input_entity(chat_id, cl))
+        await _set_sound(cl, notify_peer, value, platforms)
+        return f"Chat {chat_id} sound set to {sound} ({', '.join(platforms)})."
     except Exception as e:
         return log_and_format_error("set_chat_sound", e, chat_id=chat_id)
 
@@ -1230,6 +1297,7 @@ async def set_default_notify(
     scope: str,
     enabled: Optional[bool] = None,
     sound: Optional[str] = None,
+    platforms: Optional[List[str]] = None,
     account: Optional[str] = None,
 ) -> str:
     """
@@ -1237,6 +1305,7 @@ async def set_default_notify(
 
     scope: "users" (Private chats), "chats" (Groups) or "broadcasts" (Channels).
     enabled: turn notifications on/off. sound: "default", "none" or a ringtone id.
+    platforms: where the sound applies, "other" (desktop/web) and/or "ios"; default both.
     Refused while TELEGRAM_ALLOWED_CHAT_IDS is set, since defaults affect every chat.
     """
     try:
@@ -1253,8 +1322,16 @@ async def set_default_notify(
                 return _SOUND_HINT
         if not changes:
             return "Nothing to change: pass enabled and/or sound."
+        platforms = _DEFAULT_SOUND_PLATFORMS if platforms is None else platforms
+        error = _check_platforms(platforms)
+        if error:
+            return error
         cl = get_client(account)
-        await _merge_notify_settings(cl, _default_notify_peer(scope), **changes)
+        notify_peer = _default_notify_peer(scope)
+        if "sound" in changes:
+            await _set_sound(cl, notify_peer, changes.pop("sound"), platforms, **changes)
+        else:
+            await _merge_notify_settings(cl, notify_peer, **changes)
         return f"Default notify settings for {scope} updated (enabled={enabled}, sound={sound})."
     except Exception as e:
         return log_and_format_error("set_default_notify", e, scope=scope)
