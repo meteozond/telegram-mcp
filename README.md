@@ -27,6 +27,7 @@ Message sent successfully:
 
 - [Skills & Practical Workflows](skills/README.md)
 - [What It Can Do](#what-it-can-do)
+  - [Notification settings](#notification-settings)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [MCP Client Configuration](#mcp-client-configuration)
@@ -146,6 +147,35 @@ message: `'13/09'`, `'13/09/2026'`, or `'13/09 17:00'`. The chip opens
 copy-date / add-to-calendar / reminder actions. Plain-text messages only —
 omit `parse_mode`. For example, `send_message(chat_id, "Lunch 13/09 13:00",
 format_date="13/09 13:00")` sends a message whose date opens that menu.
+
+### Notification settings
+
+Each chat has one personal notification setting. Telegram's "exceptions" list
+is simply every chat that has one, so the tools map to three states:
+
+| State | Tool | Notifications | Leaves the archive on a new message |
+|---|---|---|---|
+| No exception | `remove_notify_exception` | follow the chat type default | yes |
+| Unmuted | `unmute_chat` | on | yes |
+| Muted | `mute_chat` (`duration_seconds` for "mute for…") | off | no |
+
+- Muting or unmuting never removes a chat from the exceptions list; only
+  `remove_notify_exception` (the "Remove" button in the apps) does.
+- A tone of `"default"` means "no own tone, use the chat type's tone"
+  (`get_default_notify`). If that is silent, the chat is silent too, so pick a
+  ringtone (`list_ringtones`) when a chat must always make a sound.
+- Tones are stored per platform: `other` (desktop/web), `ios`, `android`. The
+  server files a tone under the platform of the connection that sets it, so
+  `set_chat_sound` and `set_default_notify` open extra connections with an iOS
+  or Android `lang_pack` and write every platform by default (`platforms` narrows
+  it). Mute state is shared across platforms.
+- Every change reads the current setting and writes it back merged, which is
+  two requests. Telegram rate-limits notification changes per account (a burst
+  of ~40 triggered a 30-minute FloodWait that also blocked the official apps),
+  so change many chats one at a time with a pause.
+- Official apps send the whole setting from their local cache, so an app with a
+  stale cache can overwrite a change made here. Re-check with
+  `get_notify_settings` / `get_default_notify` after changing settings in an app.
 
 ### Incoming Event Feed (callback mode, Claude Code only)
 

@@ -1092,6 +1092,8 @@ async def mute_chat(
     """
     Mute notifications for a chat, forever or for duration_seconds
     (e.g. 7200 = "Mute for 2 hours"). Keeps the chat's tone and other settings.
+    A muted chat stays in the archive on new messages; to silence a chat but let it
+    leave the archive, use remove_notify_exception with a silent type default.
     Telegram rate-limits these changes: for many chats, call one at a time with a pause.
     """
     try:
@@ -1166,7 +1168,9 @@ async def set_chat_sound(
     Set the notification tone for a chat ("Select tone" / "Disable sound").
 
     sound: "default", "none" (notifications arrive without sound),
-    or a ringtone id from list_ringtones.
+    or a ringtone id from list_ringtones. "default" means the chat type's tone
+    (get_default_notify); if that is "none" the chat stays silent, so use a
+    ringtone when the chat must make a sound.
     platforms: where the tone applies, any of "other" (desktop/web), "ios",
     "android"; default all three.
     A tone alone does not show up in list_notify_exceptions, and
@@ -1265,7 +1269,9 @@ def _default_notify_peer(scope: str):
 async def get_default_notify(account: Optional[str] = None) -> str:
     """
     Show the global notification defaults: users = Private chats, chats = Groups,
-    broadcasts = Channels. Chats without a personal exception follow these.
+    broadcasts = Channels. Chats without a personal exception follow these, and so
+    does the tone of any chat whose own tone is "default". Official apps can rewrite
+    these from a stale cache, so re-check after changing settings in an app.
     """
     try:
         cl = get_client(account)
