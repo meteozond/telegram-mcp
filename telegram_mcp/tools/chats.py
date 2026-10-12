@@ -967,7 +967,19 @@ async def get_full_chat(chat_id: Union[int, str], account: Optional[str] = None)
         return log_and_format_error("get_full_chat", e, chat_id=chat_id)
 
 
-MUTE_FOREVER = 2**31 - 1
+_MUTE_FOREVER = 2**31 - 1
+_RINGTONE_ID_RANGE = range(-(2**63), 2**63)
+
+
+def _timestamp(value) -> Optional[int]:
+    """Telethon returns mute_until as an aware datetime; tools report unix seconds."""
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    return value
+
+
+def _is_muted(mute_until: Optional[int]) -> bool:
+    return bool(mute_until and mute_until > time.time())
 
 
 async def _update_notify_settings(cl, peer, **changes) -> None:
@@ -979,23 +991,25 @@ async def _update_notify_settings(cl, peer, **changes) -> None:
 
 async def _merge_notify_settings(cl, notify_peer, **changes) -> None:
     """
-    Merge changes into the chat's current notification settings and save them.
+    Merge changes into the current notification settings and save them.
 
     The API replaces the whole settings object, so sending a single field would
     drop the others (e.g. muting would reset a custom tone). tdesktop merges the
-    same way before every account.updateNotifySettings call.
+    same way before every account.updateNotifySettings call. This costs two
+    requests per change instead of one.
+
+    Only other_sound is echoed back: the server files the sound we send under
+    this client's platform, so copying ios/android tones would overwrite it.
     """
     current = await cl(functions.account.GetNotifySettingsRequest(peer=notify_peer))
     fields = {
         "show_previews": current.show_previews,
         "silent": current.silent,
         "mute_until": current.mute_until,
-        "sound": current.other_sound or current.android_sound or current.ios_sound,
+        "sound": current.other_sound,
         "stories_muted": current.stories_muted,
         "stories_hide_sender": current.stories_hide_sender,
-        "stories_sound": current.stories_other_sound
-        or current.stories_android_sound
-        or current.stories_ios_sound,
+        "stories_sound": current.stories_other_sound,
     }
     fields.update(changes)
     await cl(
@@ -1020,13 +1034,16 @@ async def mute_chat(
     """
     Mute notifications for a chat, forever or for duration_seconds
     (e.g. 7200 = "Mute for 2 hours"). Keeps the chat's tone and other settings.
+    Telegram rate-limits these changes: for many chats, call one at a time with a pause.
     """
     try:
         cl = get_client(account)
         if duration_seconds is not None and duration_seconds <= 0:
             return "duration_seconds must be positive; use unmute_chat to unmute."
         mute_until = (
-            MUTE_FOREVER if duration_seconds is None else int(time.time()) + duration_seconds
+            _MUTE_FOREVER
+            if duration_seconds is None
+            else min(int(time.time()) + duration_seconds, _MUTE_FOREVER)
         )
         await _update_notify_settings(cl, chat_id, mute_until=mute_until)
         if duration_seconds is None:
@@ -1046,6 +1063,7 @@ async def mute_chat(
 async def unmute_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Unmute notifications for a chat. Keeps the chat's tone and other settings.
+    Telegram rate-limits these changes: for many chats, call one at a time with a pause.
     """
     try:
         cl = get_client(account)
@@ -1055,7 +1073,7 @@ async def unmute_chat(chat_id: Union[int, str], account: Optional[str] = None) -
         return log_and_format_error("unmute_chat", e, chat_id=chat_id)
 
 
-SOUND_HINT = 'sound must be "default", "none" or a ringtone id from list_ringtones.'
+_SOUND_HINT = 'sound must be "default", "none" or a ringtone id from list_ringtones.'
 
 
 def _parse_sound(sound: str):
@@ -1063,9 +1081,14 @@ def _parse_sound(sound: str):
         return types.NotificationSoundDefault()
     if sound == "none":
         return types.NotificationSoundNone()
-    if sound.isdigit():
-        return types.NotificationSoundRingtone(id=int(sound))
-    return None
+    try:
+        ringtone_id = int(sound)
+    except ValueError:
+        return None
+    # int() also accepts non-ASCII digits such as "١٢"; ringtone ids are int64.
+    if not sound.isascii() or ringtone_id not in _RINGTONE_ID_RANGE:
+        return None
+    return types.NotificationSoundRingtone(id=ringtone_id)
 
 
 @mcp.tool(
@@ -1082,13 +1105,16 @@ async def set_chat_sound(
     Set the notification tone for a chat ("Select tone" / "Disable sound").
 
     sound: "default", "none" (notifications arrive without sound),
-    or a ringtone id from list_ringtones.
+    or a ringtone id from list_ringtones. The tone applies to desktop/other
+    clients only; phones keep their own. A tone alone does not show up in
+    list_notify_exceptions, and remove_notify_exception clears it.
+    Telegram rate-limits these changes: for many chats, call one at a time with a pause.
     """
     try:
         cl = get_client(account)
         value = _parse_sound(sound)
         if value is None:
-            return SOUND_HINT
+            return _SOUND_HINT
         await _update_notify_settings(cl, chat_id, sound=value)
         return f"Chat {chat_id} sound set to {sound}."
     except Exception as e:
@@ -1107,6 +1133,14 @@ def _describe_sound(sound) -> Optional[str]:
     return f"local:{getattr(sound, 'title', '')}"
 
 
+def _describe_sounds(settings) -> Dict[str, Optional[str]]:
+    return {
+        "ios": _describe_sound(settings.ios_sound),
+        "android": _describe_sound(settings.android_sound),
+        "other": _describe_sound(settings.other_sound),
+    }
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Get Notify Settings", openWorldHint=True, readOnlyHint=True)
 )
@@ -1116,7 +1150,9 @@ async def get_notify_settings(chat_id: Union[int, str], account: Optional[str] =
     """
     Show a chat's personal notification settings as stored on the server.
 
-    sound per platform is "default", "none", a ringtone id, or null (not set = default).
+    muted_by_exception reflects only the chat's own setting; a chat without one
+    follows get_default_notify. sound per platform is "default", "none",
+    a ringtone id, or null (not set = default).
     """
     try:
         cl = get_client(account)
@@ -1124,21 +1160,15 @@ async def get_notify_settings(chat_id: Union[int, str], account: Optional[str] =
         current = await cl(
             functions.account.GetNotifySettingsRequest(peer=types.InputNotifyPeer(input_peer))
         )
-        mute_until = current.mute_until
-        if isinstance(mute_until, datetime):
-            mute_until = int(mute_until.timestamp())
+        mute_until = _timestamp(current.mute_until)
         return json.dumps(
             {
                 "chat_id": chat_id,
                 "mute_until": mute_until,
-                "muted": bool(mute_until and mute_until > time.time()),
+                "muted_by_exception": _is_muted(mute_until),
                 "silent": current.silent,
                 "show_previews": current.show_previews,
-                "sound": {
-                    "ios": _describe_sound(current.ios_sound),
-                    "android": _describe_sound(current.android_sound),
-                    "other": _describe_sound(current.other_sound),
-                },
+                "sound": _describe_sounds(current),
             },
             ensure_ascii=False,
             indent=2,
@@ -1147,7 +1177,7 @@ async def get_notify_settings(chat_id: Union[int, str], account: Optional[str] =
         return log_and_format_error("get_notify_settings", e, chat_id=chat_id)
 
 
-DEFAULT_NOTIFY_SCOPES = ("users", "chats", "broadcasts")
+_DEFAULT_NOTIFY_SCOPES = ("users", "chats", "broadcasts")
 
 
 def _default_notify_peer(scope: str):
@@ -1172,21 +1202,15 @@ async def get_default_notify(account: Optional[str] = None) -> str:
     try:
         cl = get_client(account)
         records = {}
-        for scope in DEFAULT_NOTIFY_SCOPES:
+        for scope in _DEFAULT_NOTIFY_SCOPES:
             current = await cl(
                 functions.account.GetNotifySettingsRequest(peer=_default_notify_peer(scope))
             )
-            mute_until = current.mute_until
-            if isinstance(mute_until, datetime):
-                mute_until = int(mute_until.timestamp())
+            mute_until = _timestamp(current.mute_until)
             records[scope] = {
-                "enabled": not (mute_until and mute_until > time.time()),
+                "enabled": not _is_muted(mute_until),
                 "mute_until": mute_until,
-                "sound": {
-                    "ios": _describe_sound(current.ios_sound),
-                    "android": _describe_sound(current.android_sound),
-                    "other": _describe_sound(current.other_sound),
-                },
+                "sound": _describe_sounds(current),
             }
         return json.dumps(records, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -1213,17 +1237,20 @@ async def set_default_notify(
 
     scope: "users" (Private chats), "chats" (Groups) or "broadcasts" (Channels).
     enabled: turn notifications on/off. sound: "default", "none" or a ringtone id.
+    Refused while TELEGRAM_ALLOWED_CHAT_IDS is set, since defaults affect every chat.
     """
     try:
-        if scope not in DEFAULT_NOTIFY_SCOPES:
-            return f"scope must be one of {', '.join(DEFAULT_NOTIFY_SCOPES)}."
+        if is_chat_allowlist_enabled():
+            return "set_default_notify is disabled while the chat allowlist is active."
+        if scope not in _DEFAULT_NOTIFY_SCOPES:
+            return f"scope must be one of {', '.join(_DEFAULT_NOTIFY_SCOPES)}."
         changes = {}
         if enabled is not None:
-            changes["mute_until"] = 0 if enabled else MUTE_FOREVER
+            changes["mute_until"] = 0 if enabled else _MUTE_FOREVER
         if sound is not None:
             changes["sound"] = _parse_sound(sound)
             if changes["sound"] is None:
-                return SOUND_HINT
+                return _SOUND_HINT
         if not changes:
             return "Nothing to change: pass enabled and/or sound."
         cl = get_client(account)
@@ -1233,7 +1260,9 @@ async def set_default_notify(
         return log_and_format_error("set_default_notify", e, scope=scope)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="List Ringtones", openWorldHint=True, readOnlyHint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(title="List Ringtones", openWorldHint=True, readOnlyHint=True)
+)
 @with_account(readonly=True)
 async def list_ringtones(account: Optional[str] = None) -> str:
     """
@@ -1246,9 +1275,7 @@ async def list_ringtones(account: Optional[str] = None) -> str:
         for document in getattr(result, "ringtones", []):
             title = None
             for attribute in document.attributes:
-                title = getattr(attribute, "title", None) or getattr(
-                    attribute, "file_name", None
-                )
+                title = getattr(attribute, "title", None) or getattr(attribute, "file_name", None)
                 if title:
                     break
             records.append({"id": str(document.id), "title": title})
@@ -1272,15 +1299,18 @@ async def remove_notify_exception(chat_id: Union[int, str], account: Optional[st
     Remove a chat from notification exceptions so it follows the global default again.
 
     mute_chat/unmute_chat both create an exception (Muted/Unmuted); this is the
-    "Remove" button in Settings > Notifications > Exceptions.
+    "Remove" button in Settings > Notifications > Exceptions. It also clears
+    a custom tone set with set_chat_sound.
+    Telegram rate-limits these changes: for many chats, call one at a time with a pause.
     """
     try:
         cl = get_client(account)
-        peer = await resolve_entity(chat_id, cl)
-        # Empty settings (no flags) reset the peer to the default, as tdesktop's resetToDefault does.
+        input_peer = await resolve_input_entity(chat_id, cl)
+        # Empty settings (no flags) reset the peer to the default,
+        # as tdesktop's resetToDefault does.
         await cl(
             functions.account.UpdateNotifySettingsRequest(
-                peer=peer, settings=types.InputPeerNotifySettings()
+                peer=types.InputNotifyPeer(input_peer), settings=types.InputPeerNotifySettings()
             )
         )
         return f"Chat {chat_id} removed from notification exceptions."
@@ -1299,31 +1329,35 @@ async def list_notify_exceptions(account: Optional[str] = None) -> str:
     List chats with personal notification settings (exceptions) and their status.
 
     status is "muted" (mute_until in the future) or "unmuted" (mute_until in the past/0).
+    topic_id is set when the exception belongs to a forum topic, not the whole chat.
     """
     try:
         cl = get_client(account)
         result = await cl(functions.account.GetNotifyExceptionsRequest())
-        names = {}
-        for entity in [*getattr(result, "users", []), *getattr(result, "chats", [])]:
-            names[entity.id] = (entity, get_entity_type(entity))
-        now = int(time.time())
+        entities = {
+            utils.get_peer_id(entity): entity
+            for entity in [*getattr(result, "users", []), *getattr(result, "chats", [])]
+        }
         records = []
         for update in getattr(result, "updates", []):
             notify_peer = getattr(update, "peer", None)
             settings = getattr(update, "notify_settings", None)
-            if notify_peer is None or settings is None or not hasattr(notify_peer, "peer"):
+            if not isinstance(notify_peer, (types.NotifyPeer, types.NotifyForumTopic)):
+                continue
+            if settings is None:
                 continue
             peer_id = utils.get_peer_id(notify_peer.peer)
-            entity, entity_type = names.get(utils.resolve_id(peer_id)[0], (None, None))
-            mute_until = settings.mute_until
-            if isinstance(mute_until, datetime):
-                mute_until = int(mute_until.timestamp())
+            entity = entities.get(peer_id)
+            if is_chat_allowlist_enabled() and not is_chat_allowed(peer_id, entity):
+                continue
+            mute_until = _timestamp(settings.mute_until)
             records.append(
                 {
                     "chat_id": peer_id,
+                    "topic_id": getattr(notify_peer, "top_msg_id", None),
                     "name": utils.get_display_name(entity) if entity else None,
-                    "type": entity_type,
-                    "status": "muted" if mute_until and mute_until > now else "unmuted",
+                    "type": get_entity_type(entity) if entity else None,
+                    "status": "muted" if _is_muted(mute_until) else "unmuted",
                     "mute_until": mute_until,
                 }
             )
