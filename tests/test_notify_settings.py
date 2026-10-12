@@ -36,14 +36,15 @@ def _no_allowlist(monkeypatch):
 
 
 def _use(monkeypatch, client):
-    """Route the regular connection to `client` and the iOS one to `client.ios`."""
+    """Route the regular connection to `client` and the phone ones to `client.ios` / `.android`."""
     client.ios = _NotifyClient(client.current)
+    client.android = _NotifyClient(client.current)
 
     async def fake_resolve(chat_id, client=None):
         return INPUT_PEER
 
     async def fake_platform_client(cl, platform):
-        return {"other": cl, "ios": cl.ios}[platform]
+        return {"other": cl, "ios": cl.ios, "android": cl.android}[platform]
 
     monkeypatch.setattr(chats, "get_client", lambda account=None: client)
     monkeypatch.setattr(chats, "resolve_input_entity", fake_resolve)
@@ -212,9 +213,10 @@ async def test_set_default_notify_disables_scope(monkeypatch):
     assert request.peer == types.InputNotifyUsers()
     assert request.settings.mute_until == MUTE_FOREVER
     assert request.settings.sound == types.NotificationSoundDefault()
-    (ios_request,) = client.ios.updates
-    assert ios_request.settings.sound == types.NotificationSoundDefault()
-    assert ios_request.settings.mute_until is None
+    for phone in (client.ios, client.android):
+        (phone_request,) = phone.updates
+        assert phone_request.settings.sound == types.NotificationSoundDefault()
+        assert phone_request.settings.mute_until is None
 
 
 @pytest.mark.asyncio
@@ -233,11 +235,12 @@ async def test_set_chat_sound_writes_each_platform_with_its_own_echo(monkeypatch
 
     result = await chats.set_chat_sound(chat_id=42, sound="1")
 
-    assert result == "Chat 42 sound set to 1 (other, ios)."
+    assert result == "Chat 42 sound set to 1 (other, ios, android)."
     assert _sent(client).sound == icq
     assert _sent(client).stories_sound == story_desktop
     assert _sent(client.ios).sound == icq
     assert _sent(client.ios).stories_sound == story_phone
+    assert _sent(client.android).sound == icq
 
 
 @pytest.mark.asyncio
@@ -251,14 +254,14 @@ async def test_set_chat_sound_single_platform(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("platforms", [[], ["android"], ["ios", "web"]])
+@pytest.mark.parametrize("platforms", [[], ["web"], ["ios", "windows"]])
 async def test_set_chat_sound_rejects_unknown_platforms(monkeypatch, platforms):
     client = _use(monkeypatch, _NotifyClient())
 
     result = await chats.set_chat_sound(chat_id=42, sound="none", platforms=platforms)
 
     assert "platforms must be" in result
-    assert client.updates == client.ios.updates == []
+    assert client.updates == client.ios.updates == client.android.updates == []
 
 
 @pytest.mark.asyncio

@@ -982,11 +982,12 @@ def _is_muted(mute_until: Optional[int]) -> bool:
     return bool(mute_until and mute_until > time.time())
 
 
-# Sound platforms: "other" = desktop/web clients (this connection), "ios" = iPhone app.
-_SOUND_PLATFORMS = ("other", "ios")
-_DEFAULT_SOUND_PLATFORMS = ["other", "ios"]
+# Sound platforms: "other" = desktop/web clients (this connection), "ios" / "android" = phone apps.
+_SOUND_PLATFORMS = ("other", "ios", "android")
+_DEFAULT_SOUND_PLATFORMS = list(_SOUND_PLATFORMS)
 _PLATFORM_DEVICES = {
     "ios": {"device_model": "iPhone", "system_version": "iOS 18.7", "app_version": "12.0"},
+    "android": {"device_model": "Pixel", "system_version": "Android 15", "app_version": "12.0"},
 }
 _platform_clients: Dict[Any, Any] = {}
 
@@ -996,8 +997,8 @@ async def _platform_client(cl, platform: str):
     Return a connection the server treats as `platform` for notification sounds.
 
     The server files InputPeerNotifySettings.sound under the platform of the
-    connection that sends it (lang_pack "ios" lands in ios_sound, checked
-    2026-10-13). "other" is the regular connection; for "ios" a second connection
+    connection that sends it (lang_pack "ios" / "android" land in ios_sound /
+    android_sound, checked 2026-10-13). "other" is the regular connection; for "ios" a second connection
     is opened on the same authorization. Telethon has no public lang_pack option,
     hence the private _init_request.
     """
@@ -1166,8 +1167,8 @@ async def set_chat_sound(
 
     sound: "default", "none" (notifications arrive without sound),
     or a ringtone id from list_ringtones.
-    platforms: where the tone applies, "other" (desktop/web) and/or "ios";
-    default both. Android keeps its own tone.
+    platforms: where the tone applies, any of "other" (desktop/web), "ios",
+    "android"; default all three.
     A tone alone does not show up in list_notify_exceptions, and
     remove_notify_exception clears it.
     Telegram rate-limits these changes: for many chats, call one at a time with a pause.
@@ -1305,7 +1306,8 @@ async def set_default_notify(
 
     scope: "users" (Private chats), "chats" (Groups) or "broadcasts" (Channels).
     enabled: turn notifications on/off. sound: "default", "none" or a ringtone id.
-    platforms: where the sound applies, "other" (desktop/web) and/or "ios"; default both.
+    platforms: where the sound applies, any of "other" (desktop/web), "ios", "android";
+    default all three.
     Refused while TELEGRAM_ALLOWED_CHAT_IDS is set, since defaults affect every chat.
     """
     try:
