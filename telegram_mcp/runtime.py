@@ -161,7 +161,25 @@ install_protocol_compatibility()
 # The shared HTTP service can be consumed by long-lived MCP clients. Stateless requests keep
 # those clients usable across server-process restarts instead of rejecting their next call
 # with "No valid session ID provided". Stdio transport remains unaffected.
-mcp = FastMCP("telegram", stateless_http=True)
+# Shown to the model on connect. Notification settings get their own section because
+# Telegram's model (exceptions, archive behaviour, per-platform tones) is not guessable
+# from individual tool descriptions; see "Notification settings" in README.md.
+SERVER_INSTRUCTIONS = (
+    "Notification settings (mute_chat, unmute_chat, remove_notify_exception, set_chat_sound, set_default_notify):\n"
+    '- Each chat has one personal notification setting; Telegram\'s "exceptions" list is every chat that has one. Three states (get_notify_settings mute_until: null / 0 or past / future):\n'
+    "  - no exception (remove_notify_exception): follows the chat type default from get_default_notify; the chat leaves the archive on new messages.\n"
+    "  - Unmuted (unmute_chat): notifications on even if the type default is off; leaves the archive.\n"
+    "  - Muted (mute_chat, optionally duration_seconds): no notifications; the chat stays in the archive.\n"
+    "- mute_chat/unmute_chat never remove the exception; only remove_notify_exception does. A timed mute that expires leaves an Unmuted exception, so the chat then notifies even if its type default is off; schedule remove_notify_exception if it should follow the default again.\n"
+    '- To silence a chat but keep it leaving the archive: remove its exception and make the type default off (set_default_notify enabled=false: no notifications) or quiet (sound="none": notifications without sound). Do not mute it.\n'
+    "- A temporary change must restore the previous state, not a fixed one: read get_notify_settings first and later call remove_notify_exception / unmute_chat / mute_chat to match it.\n"
+    '- sound "default" means "use the chat type\'s tone"; if that tone is "none" the chat is silent. Use a ringtone id from list_ringtones when a chat must make a sound.\n'
+    "- Tones are per platform (other = desktop/web, ios, android); set_chat_sound and set_default_notify write all three by default. Mute state is shared by all platforms.\n"
+    "- Telegram rate-limits notification changes per account (a burst of ~40 caused a 30-minute FloodWait that also blocked the official apps): change many chats one at a time with ~2 s between calls, never in parallel; on a FloodWait error stop and wait the reported time. Prefer set_default_notify when the user means a whole chat type.\n"
+    "- Official apps can overwrite settings from a stale cache; re-read after the user changes settings in an app.\n"
+)
+
+mcp = FastMCP("telegram", stateless_http=True, instructions=SERVER_INSTRUCTIONS)
 
 # Annotate all tool results with audience=["user"] so MCP clients know
 # the content is user-generated data, not instructions for the model.

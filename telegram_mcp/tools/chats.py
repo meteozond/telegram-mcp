@@ -1094,6 +1094,8 @@ async def mute_chat(
     (e.g. 7200 = "Mute for 2 hours"). Keeps the chat's tone and other settings.
     A muted chat stays in the archive on new messages; to silence a chat but let it
     leave the archive, use remove_notify_exception with a silent type default.
+    When a timed mute expires the chat keeps an Unmuted exception and notifies
+    even if its type default is off.
     Telegram rate-limits these changes: for many chats, call one at a time with a pause.
     """
     try:

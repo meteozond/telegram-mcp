@@ -336,3 +336,10 @@ async def test_list_notify_exceptions_respects_allowlist(monkeypatch):
     records = json.loads(await chats.list_notify_exceptions())
 
     assert [record["chat_id"] for record in records] == [42]
+
+
+def test_server_instructions_explain_notification_model():
+    instructions = runtime.mcp.instructions
+
+    for term in ("remove_notify_exception", "stays in the archive", "per platform", "FloodWait"):
+        assert term in instructions
