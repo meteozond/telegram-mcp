@@ -972,10 +972,8 @@ MUTE_FOREVER = 2**31 - 1
 
 async def _update_notify_settings(cl, peer, **changes) -> None:
     """Merge changes into a chat's notification settings (see _merge_notify_settings)."""
-    from telethon.tl.types import InputNotifyPeer
-
     await _merge_notify_settings(
-        cl, InputNotifyPeer(await resolve_input_entity(peer, cl)), **changes
+        cl, types.InputNotifyPeer(await resolve_input_entity(peer, cl)), **changes
     )
 
 
@@ -987,8 +985,6 @@ async def _merge_notify_settings(cl, notify_peer, **changes) -> None:
     drop the others (e.g. muting would reset a custom tone). tdesktop merges the
     same way before every account.updateNotifySettings call.
     """
-    from telethon.tl.types import InputPeerNotifySettings
-
     current = await cl(functions.account.GetNotifySettingsRequest(peer=notify_peer))
     fields = {
         "show_previews": current.show_previews,
@@ -1004,7 +1000,7 @@ async def _merge_notify_settings(cl, notify_peer, **changes) -> None:
     fields.update(changes)
     await cl(
         functions.account.UpdateNotifySettingsRequest(
-            peer=notify_peer, settings=InputPeerNotifySettings(**fields)
+            peer=notify_peer, settings=types.InputPeerNotifySettings(**fields)
         )
     )
 
@@ -1063,18 +1059,12 @@ SOUND_HINT = 'sound must be "default", "none" or a ringtone id from list_rington
 
 
 def _parse_sound(sound: str):
-    from telethon.tl.types import (
-        NotificationSoundDefault,
-        NotificationSoundNone,
-        NotificationSoundRingtone,
-    )
-
     if sound == "default":
-        return NotificationSoundDefault()
+        return types.NotificationSoundDefault()
     if sound == "none":
-        return NotificationSoundNone()
+        return types.NotificationSoundNone()
     if sound.isdigit():
-        return NotificationSoundRingtone(id=int(sound))
+        return types.NotificationSoundRingtone(id=int(sound))
     return None
 
 
@@ -1108,12 +1098,11 @@ async def set_chat_sound(
 def _describe_sound(sound) -> Optional[str]:
     if sound is None:
         return None
-    name = type(sound).__name__
-    if name == "NotificationSoundDefault":
+    if isinstance(sound, types.NotificationSoundDefault):
         return "default"
-    if name == "NotificationSoundNone":
+    if isinstance(sound, types.NotificationSoundNone):
         return "none"
-    if name == "NotificationSoundRingtone":
+    if isinstance(sound, types.NotificationSoundRingtone):
         return str(sound.id)
     return f"local:{getattr(sound, 'title', '')}"
 
@@ -1131,11 +1120,9 @@ async def get_notify_settings(chat_id: Union[int, str], account: Optional[str] =
     """
     try:
         cl = get_client(account)
-        from telethon.tl.types import InputNotifyPeer
-
         input_peer = await resolve_input_entity(chat_id, cl)
         current = await cl(
-            functions.account.GetNotifySettingsRequest(peer=InputNotifyPeer(input_peer))
+            functions.account.GetNotifySettingsRequest(peer=types.InputNotifyPeer(input_peer))
         )
         mute_until = current.mute_until
         if isinstance(mute_until, datetime):
@@ -1164,12 +1151,10 @@ DEFAULT_NOTIFY_SCOPES = ("users", "chats", "broadcasts")
 
 
 def _default_notify_peer(scope: str):
-    from telethon.tl.types import InputNotifyBroadcasts, InputNotifyChats, InputNotifyUsers
-
     return {
-        "users": InputNotifyUsers,
-        "chats": InputNotifyChats,
-        "broadcasts": InputNotifyBroadcasts,
+        "users": types.InputNotifyUsers,
+        "chats": types.InputNotifyChats,
+        "broadcasts": types.InputNotifyBroadcasts,
     }[scope]()
 
 
@@ -1291,13 +1276,11 @@ async def remove_notify_exception(chat_id: Union[int, str], account: Optional[st
     """
     try:
         cl = get_client(account)
-        from telethon.tl.types import InputPeerNotifySettings
-
         peer = await resolve_entity(chat_id, cl)
         # Empty settings (no flags) reset the peer to the default, as tdesktop's resetToDefault does.
         await cl(
             functions.account.UpdateNotifySettingsRequest(
-                peer=peer, settings=InputPeerNotifySettings()
+                peer=peer, settings=types.InputPeerNotifySettings()
             )
         )
         return f"Chat {chat_id} removed from notification exceptions."
